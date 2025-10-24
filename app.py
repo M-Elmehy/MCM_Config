@@ -5,8 +5,8 @@ from openpyxl import load_workbook
 from openpyxl.styles import Border, Side, PatternFill
 from pathlib import Path
 
-# === Excel Generation Logic ===
-def generate_excel(devices, blocks, rows_per_block, node_seq, func_rules, block_rules, output_name):
+# === Excel and Data Generation Logic ===
+def build_dataframe(devices, blocks, rows_per_block, node_seq, func_rules, block_rules):
     param_template = [
         "MCM.CONFIG.Port1MasterCmd[{i}].Enable",
         "MCM.CONFIG.Port1MasterCmd[{i}].IntAddress",
@@ -77,9 +77,10 @@ def generate_excel(devices, blocks, rows_per_block, node_seq, func_rules, block_
 
             global_block_idx += 1
 
-    df = pd.DataFrame(rows)
+    return pd.DataFrame(rows)
 
-    # === Save to Excel ===
+
+def generate_excel(df, output_name, devices, blocks, rows_per_block):
     output_path = Path(output_name)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="Port1", index=False)
@@ -122,7 +123,6 @@ def generate_excel(devices, blocks, rows_per_block, node_seq, func_rules, block_
 
 # === Streamlit UI ===
 st.set_page_config(page_title="MasterCmd Parameter Assignment Configurator", layout="wide")
-
 st.title("⚙️ MasterCmd Parameter Assignment Configurator")
 
 st.markdown("""
@@ -217,11 +217,19 @@ if st.button("💾 Save Configuration"):
     st.download_button("⬇️ Download Saved Config", data=json.dumps(config_to_save, indent=4),
                        file_name=save_name, mime="application/json")
 
+# --- Preview Button ---
+if st.button("👁 Preview Port1 Table"):
+    with st.spinner("Generating preview..."):
+        df_preview = build_dataframe(devices, blocks, rows_per_block, nodes, func_rules, block_rules)
+        st.success("✅ Preview generated below")
+        st.dataframe(df_preview, use_container_width=True, height=500)
+
 # --- Generate Excel Button ---
 if st.button("🚀 Generate Excel File"):
     with st.spinner("Generating Excel file..."):
         try:
-            output_path = generate_excel(devices, blocks, rows_per_block, nodes, func_rules, block_rules, output_name)
+            df = build_dataframe(devices, blocks, rows_per_block, nodes, func_rules, block_rules)
+            output_path = generate_excel(df, output_name, devices, blocks, rows_per_block)
             with open(output_path, "rb") as f:
                 st.success("✅ Excel file generated successfully!")
                 st.download_button("⬇️ Download Excel File", data=f, file_name=output_name,
