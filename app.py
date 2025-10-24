@@ -3,7 +3,6 @@ import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import Border, Side, PatternFill
 from pathlib import Path
-import io
 
 
 # === Excel Generation Logic ===
@@ -125,7 +124,7 @@ st.set_page_config(page_title="MasterCmd Sequence Generator", layout="wide")
 st.title("⚙️ MasterCmd Excel Sequence Generator")
 
 st.markdown("""
-Easily generate **Master Command configuration Excel** files with block-based parameters and automatic IntAddress sequencing.
+Generate **Master Command configuration Excel** files with flexible block-based parameters and automatic IntAddress sequencing.
 """)
 
 # --- Node sequence and device count ---
@@ -136,7 +135,7 @@ auto_devices = len(nodes)
 
 manual_devices = st.number_input("Number of Devices (optional)", min_value=1, value=auto_devices)
 if manual_devices != auto_devices:
-    st.warning(f"⚠️ The entered number of devices ({manual_devices}) differs from the node sequence ({auto_devices}).")
+    st.warning(f"⚠️ Entered device count ({manual_devices}) differs from node sequence ({auto_devices}).")
 
 devices = auto_devices
 
@@ -144,39 +143,41 @@ devices = auto_devices
 blocks = st.number_input("Blocks per Device", min_value=1, value=6)
 rows_per_block = st.number_input("Rows per Block", min_value=1, value=8)
 
-st.markdown("### 🧩 Function Configuration")
-st.write("Enter `.IntAddress` starting value and offset for **each Func ID** used across blocks.")
-
-func_rules = {}
-num_funcs = st.number_input("Number of distinct Func IDs", min_value=1, value=2, step=1)
-for i in range(1, num_funcs + 1):
-    cols = st.columns(3)
-    func_id = cols[0].text_input(f"Func ID {i}", value=str(i))
-    start = cols[1].number_input(f"Start IntAddress for Func {i}", value=i * 10)
-    offset = cols[2].number_input(f"Offset per new device for Func {i}", value=10)
-    func_rules[func_id] = {"start": start, "offset": offset}
-
-# --- Block configuration ---
 st.markdown("### 🔢 Block Configuration (per device)")
-st.write("For each block, specify Enable, Func, DevAddress, and Count. "
-         "If Enable = 0, other fields can be left blank.")
+st.write("Enter parameters per block. If `Enable = 0`, other fields can be left blank.")
 
 block_rules = {}
 cols = st.columns([1, 1, 1, 1, 1])
 cols[0].write("**Block No.**")
-cols[1].write("**Enable**")
+cols[1].write("**Enable (0/1/2)**")
 cols[2].write("**Func**")
 cols[3].write("**DevAddress**")
 cols[4].write("**Count**")
 
+func_values = set()
+
 for b in range(1, blocks + 1):
     c = st.columns([1, 1, 1, 1, 1])
     c[0].write(f"{b}")
-    enable = c[1].number_input(f"Enable_{b}", min_value=0, max_value=1, value=1, label_visibility="collapsed")
+    enable = c[1].number_input(f"Enable_{b}", min_value=0, max_value=2, value=1, label_visibility="collapsed")
     func = c[2].text_input(f"Func_{b}", value=str(b), label_visibility="collapsed") if enable != 0 else ""
     devaddr = c[3].text_input(f"DevAddr_{b}", value=str(100 + b), label_visibility="collapsed") if enable != 0 else ""
     count = c[4].number_input(f"Count_{b}", min_value=0, value=b, label_visibility="collapsed") if enable != 0 else 0
     block_rules[b] = {"Enable": enable, "Func": func, "DevAddress": devaddr, "Count": count}
+    if func not in ("", None):
+        func_values.add(func)
+
+# --- Func Configuration ---
+st.markdown("### 🧩 Function Configuration")
+st.write("Automatically recognized from unique Func IDs entered above.")
+
+func_rules = {}
+for func_id in sorted(func_values):
+    cols = st.columns(3)
+    cols[0].write(f"**Func ID {func_id}**")
+    start = cols[1].number_input(f"Start_Int_{func_id}", value=int(func_id) * 10, label_visibility="collapsed")
+    offset = cols[2].number_input(f"Offset_{func_id}", value=10, label_visibility="collapsed")
+    func_rules[func_id] = {"start": start, "offset": offset}
 
 output_name = st.text_input("Output Excel File Name", "MasterCmd_Sequence_Generated.xlsx")
 
