@@ -1,238 +1,165 @@
 import streamlit as st
 import pandas as pd
-import json
-from openpyxl import load_workbook
-from openpyxl.styles import Border, Side, PatternFill
-from pathlib import Path
+import numpy as np
+from io import BytesIO
+import openpyxl
+from openpyxl.styles import PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
 
-# === Excel and Data Generation Logic ===
-def build_dataframe(devices, blocks, rows_per_block, node_seq, func_rules, block_rules):
-    param_template = [
-        "MCM.CONFIG.Port1MasterCmd[{i}].Enable",
-        "MCM.CONFIG.Port1MasterCmd[{i}].IntAddress",
-        "MCM.CONFIG.Port1MasterCmd[{i}].PollInt",
-        "MCM.CONFIG.Port1MasterCmd[{i}].Count",
-        "MCM.CONFIG.Port1MasterCmd[{i}].Swap",
-        "MCM.CONFIG.Port1MasterCmd[{i}].Node",
-        "MCM.CONFIG.Port1MasterCmd[{i}].Func",
-        "MCM.CONFIG.Port1MasterCmd[{i}].DevAddress",
-    ]
-
-    rows = []
-    global_block_idx = 0
-    prev_intaddr = {}
-    prev_count = {}
-
-    for device_no in range(1, devices + 1):
-        node_no = node_seq[device_no - 1]
-
-        for block_no in range(1, blocks + 1):
-            idx = global_block_idx
-            rule = block_rules[block_no]
-
-            enable = rule.get("Enable", 0)
-            enable = 0 if enable in ("", None) else enable
-            func = rule.get("Func", "4") if enable != 0 else ""
-            devaddr = rule.get("DevAddress", "") if enable != 0 else ""
-            count = rule.get("Count", "") if enable != 0 else ""
-
-            func_id = str(func)
-            func_conf = func_rules.get(func_id, {"start": 0, "offset": 10})
-
-            for p in param_template:
-                param = p.format(i=idx)
-                base = param.split('.')[-1]
-                cfg = ""
-
-                if base == "Enable":
-                    cfg = enable
-                elif base == "Func":
-                    cfg = func
-                elif base == "DevAddress":
-                    cfg = devaddr
-                elif base == "Count":
-                    cfg = count
-                elif base == "Node":
-                    cfg = node_no
-                elif base == "IntAddress":
-                    if enable == 0 or func == "":
-                        cfg = ""
-                    else:
-                        if func_id not in prev_intaddr:
-                            cfg = func_conf["start"]
-                        else:
-                            cfg = prev_intaddr[func_id] + prev_count.get(func_id, 0)
-                            if device_no > 1:
-                                cfg += func_conf["offset"]
-                        prev_intaddr[func_id] = cfg
-                        prev_count[func_id] = int(count) if count != "" else 0
-
-                rows.append({
-                    "Device No.": device_no,
-                    "Block No.": block_no,
-                    "Node No.": node_no,
-                    "Parameter": param,
-                    "ConfigValue": cfg
-                })
-
-            global_block_idx += 1
-
-    return pd.DataFrame(rows)
-
-
-def generate_excel(df, output_name, devices, blocks, rows_per_block):
-    output_path = Path(output_name)
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Port1", index=False)
-        pd.DataFrame(columns=df.columns).to_excel(writer, sheet_name="Port2", index=False)
-
-    # === Formatting ===
-    wb = load_workbook(output_path)
-    ws = wb["Port1"]
-
-    thick = Side(border_style="thick", color="000000")
-    fill_colors = ["FFF2CC", "D9EAD3", "FCE5CD", "D0E0E3", "EAD1DC", "F4CCCC"]
-
-    start_row = 2
-    row_idx = start_row
-
-    for device_no in range(1, devices + 1):
-        for block_no in range(1, blocks + 1):
-            color = fill_colors[(block_no - 1) % len(fill_colors)]
-            fill = PatternFill(fill_type="solid", fgColor=color)
-
-            block_start = row_idx
-            block_end = block_start + rows_per_block - 1
-
-            for r in range(block_start, block_end + 1):
-                for c in range(1, 6):
-                    ws.cell(row=r, column=c).fill = fill
-
-            for col in range(1, 6):
-                ws.cell(row=block_start, column=col).border = Border(top=thick)
-                ws.cell(row=block_end, column=col).border = Border(bottom=thick)
-            for rown in range(block_start, block_end + 1):
-                ws.cell(row=rown, column=1).border = Border(left=thick)
-                ws.cell(row=rown, column=5).border = Border(right=thick)
-
-            row_idx = block_end + 1
-
-    wb.save(output_path)
-    return output_path
-
-
-# === Streamlit UI ===
 st.set_page_config(page_title="MasterCmd Parameter Assignment Configurator", layout="wide")
+
 st.title("⚙️ MasterCmd Parameter Assignment Configurator")
 
+# --- Step 1: User Inputs ---
+st.sidebar.header("Configuration Settings")
+
+num_blocks = st.sidebar.number_input("Blocks per Device", min_value=1, value=10, step=1)
+nodes_sequence = st.sidebar.text_area(
+    "Enter Node Numbers (comma-separated)",
+    "26,27,28,29,30,31,32,33,34,35",
+)
+node_numbers = [int(n.strip()) for n in nodes_sequence.split(",") if n.strip().isdigit()]
+num_devices = len(node_numbers)
+
+entered_device_count = st.sidebar.number_input("Number of Devices (auto-calculated)", value=num_devices, step=1)
+if entered_device_count != num_devices:
+    st.sidebar.warning(f"⚠️ Entered number ({entered_device_count}) differs from detected nodes ({num_devices}).")
+
+st.sidebar.write("")
+
+# --- Step 2: Block Parameter Table Input ---
+st.subheader("🧱 Block Parameter Configuration")
+
 st.markdown("""
-Use this tool to build and export **MasterCmd configuration Excel files** with automatic IntAddress sequencing.
-You can also save and reload configuration templates.
+Enter the configuration values for each block.
+- Leave **Enable** blank → treated as 0  
+- **Enable** can be 0, 1, or 2  
+- **Func** default = 4  
 """)
 
-# --- Load or Create Config ---
-config_data = None
-uploaded_config = st.file_uploader("📤 Upload a saved configuration (JSON)", type=["json"])
-if uploaded_config:
-    config_data = json.load(uploaded_config)
-    st.success("Configuration loaded successfully!")
+default_data = {
+    "Block No.": list(range(1, num_blocks + 1)),
+    "Enable": [1] * num_blocks,
+    "Func": [4] * num_blocks,
+    "DevAddress": [100 + i for i in range(num_blocks)],
+    "Count": [1] * num_blocks,
+}
+block_df = pd.DataFrame(default_data)
+edited_df = st.data_editor(block_df, num_rows="dynamic", key="block_table")
 
-# --- Node sequence and device count ---
-node_seq_input = st.text_input(
-    "Enter Node Numbers (comma-separated):",
-    config_data.get("node_seq_input", "26,27,28,29,30,31,32,33,34,35") if config_data else "26,27,28,29,30,31,32,33,34,35"
-)
-nodes = [int(x.strip()) for x in node_seq_input.split(",") if x.strip()]
-auto_devices = len(nodes)
+# --- Step 3: Function Configuration ---
+st.subheader("🧩 Function Configuration")
 
-manual_devices = st.number_input("Number of Devices (optional)", min_value=1, value=config_data.get("manual_devices", auto_devices) if config_data else auto_devices)
-if manual_devices != auto_devices:
-    st.warning(f"⚠️ Entered device count ({manual_devices}) differs from node sequence ({auto_devices}).")
-devices = auto_devices
+func_ids = sorted(edited_df["Func"].dropna().unique())
+func_config = {}
+cols = st.columns(len(func_ids))
+for i, func_id in enumerate(func_ids):
+    with cols[i]:
+        st.markdown(f"**Function Code {func_id}**")
+        init_addr = st.number_input(f"Initial Internal Address", min_value=0, value=0, key=f"init_{func_id}")
+        offset = st.number_input(f"New Device Offset", min_value=0, value=10, key=f"offset_{func_id}")
+        func_config[func_id] = {"initial": init_addr, "offset": offset}
 
-# --- Other configuration ---
-blocks = st.number_input("Blocks per Device", min_value=1, value=config_data.get("blocks", 10) if config_data else 10)
-rows_per_block = st.number_input("Rows per Block", min_value=1, value=config_data.get("rows_per_block", 8) if config_data else 8)
+# --- Step 4: Preview or Generate ---
+col1, col2 = st.columns([1, 1])
+generate_clicked = col1.button("💾 Generate Excel")
+preview_clicked = col2.button("👁️ Preview Output")
 
-st.markdown("### 🔢 Block Configuration (per device)")
-st.write("Enter parameters per block. If `Enable` is blank or `0`, other fields can be left blank.")
+def generate_excel():
+    rows = []
+    intaddress_track = {f: func_config[f]["initial"] for f in func_ids}
 
-block_rules = {}
-cols = st.columns([1, 1, 1, 1, 1])
-cols[0].write("**Block No.**")
-cols[1].write("**Enable (0/1/2)**")
-cols[2].write("**Func**")
-cols[3].write("**DevAddress**")
-cols[4].write("**Count**")
+    for dev_idx, node in enumerate(node_numbers, start=1):
+        for _, row in edited_df.iterrows():
+            block_no = row["Block No."]
+            enable = 0 if pd.isna(row["Enable"]) else int(row["Enable"])
+            func = 4 if pd.isna(row["Func"]) else int(row["Func"])
+            devaddr = int(row["DevAddress"])
+            count = int(row["Count"])
 
-func_values = set()
+            # Only calculate IntAddress for blocks with enable > 0
+            if enable > 0:
+                if dev_idx > 1 and row["Block No."] == 1:
+                    # Apply new device offset only for first block of this func
+                    intaddress_track[func] += func_config[func]["offset"]
+                intaddr = intaddress_track[func]
+                intaddress_track[func] += count
+            else:
+                intaddr = None
 
-for b in range(1, blocks + 1):
-    prev = config_data["block_rules"].get(str(b), {}) if config_data else {}
-    c = st.columns([1, 1, 1, 1, 1])
-    c[0].write(f"{b}")
-    enable = c[1].text_input(f"Enable_{b}", value=str(prev.get("Enable", "")), label_visibility="collapsed")
-    enable = int(enable) if enable.isdigit() else 0
-    func = c[2].text_input(f"Func_{b}", value=str(prev.get("Func", "4")), label_visibility="collapsed") if enable != 0 else ""
-    devaddr = c[3].text_input(f"DevAddr_{b}", value=str(prev.get("DevAddress", "")), label_visibility="collapsed") if enable != 0 else ""
-    count = c[4].number_input(f"Count_{b}", min_value=0, value=int(prev.get("Count", b)), label_visibility="collapsed") if enable != 0 else 0
-    block_rules[b] = {"Enable": enable, "Func": func, "DevAddress": devaddr, "Count": count}
-    if func not in ("", None):
-        func_values.add(func)
+            # Add parameter rows (simplified pattern)
+            params = [
+                ("Enable", enable),
+                ("Func", func),
+                ("DevAddress", devaddr),
+                ("Count", count),
+                ("IntAddress", intaddr if intaddr is not None else ""),
+                ("Node", node),
+            ]
+            for pname, val in params:
+                rows.append({
+                    "Device No.": dev_idx,
+                    "Block No.": block_no,
+                    "Node No.": node,
+                    "Parameter": f"Cmd[{block_no}].{pname}",
+                    "ConfigValue": val,
+                })
 
-# --- Function Configuration ---
-st.markdown("### 🧩 Function Configuration")
-st.write("Automatically detected from unique **Function Codes** entered above.")
+    df = pd.DataFrame(rows)
 
-cols = st.columns([1, 1, 1])
-cols[0].write("**Function Code**")
-cols[1].write("**Initial Internal Address**")
-cols[2].write("**New Device Offset**")
+    # Apply Excel formatting
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Port1"
 
-func_rules = {}
-for func_id in sorted(func_values):
-    prev = config_data["func_rules"].get(func_id, {}) if config_data else {}
-    cols = st.columns([1, 1, 1])
-    cols[0].write(f"{func_id}")
-    start = cols[1].number_input(f"Start_Int_{func_id}", value=int(prev.get("start", int(func_id) * 10)), label_visibility="collapsed")
-    offset = cols[2].number_input(f"Offset_{func_id}", value=int(prev.get("offset", 10)), label_visibility="collapsed")
-    func_rules[func_id] = {"start": start, "offset": offset}
+    for r in dataframe_to_rows(df, index=False, header=True):
+        ws.append(r)
 
-output_name = st.text_input("Output Excel File Name", config_data.get("output_name", "MasterCmd_Sequence_Generated.xlsx") if config_data else "MasterCmd_Sequence_Generated.xlsx")
+    # Styling
+    thin = Side(border_style="thick", color="000000")
+    border = Border(top=thin, bottom=thin, left=thin, right=thin)
+    fills = ["ADD8E6", "90EE90", "FFD580", "FFB6C1", "D3D3D3"]
 
-# --- Save Config Button ---
-if st.button("💾 Save Configuration"):
-    config_to_save = {
-        "node_seq_input": node_seq_input,
-        "manual_devices": manual_devices,
-        "blocks": blocks,
-        "rows_per_block": rows_per_block,
-        "block_rules": block_rules,
-        "func_rules": func_rules,
-        "output_name": output_name
+    for idx, device in enumerate(df["Device No."].unique(), start=1):
+        color = fills[(idx - 1) % len(fills)]
+        dev_rows = df[df["Device No."] == device].index
+        for i in dev_rows:
+            for c in range(1, len(df.columns) + 1):
+                ws.cell(row=i + 2, column=c).fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
+        ws.cell(row=dev_rows.min() + 2, column=1).border = border
+        ws.cell(row=dev_rows.max() + 2, column=len(df.columns)).border = border
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return df, output
+
+if preview_clicked:
+    preview_df, _ = generate_excel()
+    st.dataframe(preview_df)
+
+if generate_clicked:
+    df, output = generate_excel()
+    st.success("✅ Excel file generated successfully!")
+    st.download_button("⬇️ Download Excel", data=output, file_name="MasterCmd_Sequence_R01.xlsx")
+
+# --- Save/Load Config ---
+st.sidebar.subheader("⚙️ Save / Load Configuration")
+if st.sidebar.button("💾 Save Current Configuration"):
+    config_data = {
+        "blocks": edited_df.to_dict(),
+        "func_config": func_config,
+        "nodes": node_numbers,
     }
-    save_name = "MasterCmd_Config_Saved.json"
-    with open(save_name, "w") as f:
-        json.dump(config_to_save, f, indent=4)
-    st.download_button("⬇️ Download Saved Config", data=json.dumps(config_to_save, indent=4),
-                       file_name=save_name, mime="application/json")
+    st.sidebar.download_button(
+        label="⬇️ Download Config JSON",
+        data=pd.Series(config_data).to_json(),
+        file_name="config.json",
+    )
 
-# --- Preview Button ---
-if st.button("👁 Preview Port1 Table"):
-    with st.spinner("Generating preview..."):
-        df_preview = build_dataframe(devices, blocks, rows_per_block, nodes, func_rules, block_rules)
-        st.success("✅ Preview generated below")
-        st.dataframe(df_preview, use_container_width=True, height=500)
-
-# --- Generate Excel Button ---
-if st.button("🚀 Generate Excel File"):
-    with st.spinner("Generating Excel file..."):
-        try:
-            df = build_dataframe(devices, blocks, rows_per_block, nodes, func_rules, block_rules)
-            output_path = generate_excel(df, output_name, devices, blocks, rows_per_block)
-            with open(output_path, "rb") as f:
-                st.success("✅ Excel file generated successfully!")
-                st.download_button("⬇️ Download Excel File", data=f, file_name=output_name,
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        except Exception as e:
-            st.error(f"❌ Error: {e}")
+uploaded_config = st.sidebar.file_uploader("Upload Config JSON", type=["json"])
+if uploaded_config:
+    import json
+    loaded = json.load(uploaded_config)
+    st.session_state["block_table"] = pd.DataFrame(loaded["blocks"])
+    st.sidebar.success("✅ Configuration loaded successfully!")
